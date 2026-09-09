@@ -11,3 +11,4 @@ find_package(CUDAToolkit REQUIRED)
 
 add_subdirectory(sgemm)
 add_subdirectory(histogram)
+add_subdirectory(transpose)
