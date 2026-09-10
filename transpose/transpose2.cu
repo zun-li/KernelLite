@@ -4,27 +4,29 @@
 #define BDIMX 32
 #define BDIMY 16
 
-__global__ void transpose(float *out, float *in, int nx, int ny) {
-    __shared__ float tile[BDIMY][BDIMX];
-
+__global__ void transpose(float *out, float *in, const int nx, const int ny) {
+    const int pad = 1;
+    __shared__ float tile[BDIMY][BDIMX + pad];
+    // original
     unsigned int ix = blockDim.x * blockIdx.x + threadIdx.x;
     unsigned int iy = blockDim.y * blockIdx.y + threadIdx.y;
-    unsigned int idx = iy * nx + ix;
-
-    if (ix < nx && iy < ny) {
-        tile[threadIdx.y][threadIdx.x] = in[idx];
-    }
-    __syncthreads();
-
+    // linear global memory index for original
+    unsigned int ti = iy * nx + ix;
+    // thread index in transposed block
     unsigned int bidx = threadIdx.y * blockDim.x + threadIdx.x;
+
     unsigned int irow = bidx / blockDim.y;
     unsigned int icol = bidx % blockDim.y;
+    // coordinate in transposed matrix
+    ix = blockIdx.y * blockDim.y + icol;
+    iy = blockIdx.x * blockDim.x + irow;
 
-    unsigned int ox = blockIdx.y * blockDim.y + icol;
-    unsigned int oy = blockIdx.x * blockDim.x + irow;
-    unsigned int to = oy * ny + ox;
+    // linear global memory index for transposed matrix
+    unsigned int to = iy * ny + ix;
 
-    if (ox < ny && oy < nx) {
+    if (ix < nx && iy < ny) {
+        tile[threadIdx.y][threadIdx.x] = in[ti];
+        __syncthreads();
         out[to] = tile[icol][irow];
     }
 }

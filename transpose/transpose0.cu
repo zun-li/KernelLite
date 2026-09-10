@@ -35,7 +35,20 @@ int main() {
         (nx + blockSize.x - 1) / blockSize.x,
         (ny + blockSize.y - 1) / blockSize.y
     );
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
     transpose<<<gridSize, blockSize>>>(d_out, d_in, nx, ny);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("Kernel execution time: %.3f ms\n", ms);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     cudaMemcpy(h_out, d_out, size, cudaMemcpyDeviceToHost);
 
@@ -49,9 +62,9 @@ int main() {
     }
 
     if (errors == 0) {
-        printf("PASS: matrix transposition verified.\n");
+        printf("[PASS] matrix transposition verified.\n");
     } else {
-        fprintf(stderr, "FAIL: %lld mismatches.\n", errors);
+        fprintf(stderr, "[FAIL] %lld mismatches.\n", errors);
     }
 
     free(h_in);
