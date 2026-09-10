@@ -9,10 +9,10 @@ __global__ void transpose(float *out, float *in, int nx, int ny) {
 
     unsigned int ix = blockDim.x * blockIdx.x + threadIdx.x;
     unsigned int iy = blockDim.y * blockIdx.y + threadIdx.y;
-    unsigned int idx = iy * nx + ix;
+    unsigned int ti = iy * nx + ix;
 
     if (ix < nx && iy < ny) {
-        tile[threadIdx.y][threadIdx.x] = in[idx];
+        tile[threadIdx.y][threadIdx.x] = in[ti];
     }
     __syncthreads();
 

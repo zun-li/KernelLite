@@ -6,27 +6,29 @@
 
 __global__ void transpose(float *out, float *in, int nx, int ny) {
     const int pad = 1;
-    __shared__ float tile[BDIMY][BDIMX + pad];
-
-    unsigned int ix = blockDim.x * blockIdx.x + threadIdx.x;
+    __shared__ float tile[BDIMY][BDIMX * 2 + pad];
+    
+    unsigned int ix = 2 * blockDim.x * blockIdx.x + threadIdx.x;
     unsigned int iy = blockDim.y * blockIdx.y + threadIdx.y;
     unsigned int ti = iy * nx + ix;
-    
-    if (ix < nx && iy < ny) {
-        tile[threadIdx.y][threadIdx.x] = in[ti];
+
+    if (iy < ny) {
+        if (ix < nx) tile[threadIdx.y][threadIdx.x] = in[ti];
+        if (ix + BDIMX < nx) tile[threadIdx.y][threadIdx.x + BDIMX] = in[ti + BDIMX];
     }
     __syncthreads();
 
-    unsigned int bidx = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int bidx = blockDim.x * threadIdx.y + threadIdx.x;
     unsigned int irow = bidx / blockDim.y;
     unsigned int icol = bidx % blockDim.y;
 
     unsigned int ox = blockIdx.y * blockDim.y + icol;
-    unsigned int oy = blockIdx.x * blockDim.x + irow;
+    unsigned int oy = 2 * blockIdx.x * blockDim.x + irow;
     unsigned int to = oy * ny + ox;
 
-    if (ox < ny && oy < nx) {
-        out[to] = tile[icol][irow];
+    if (ox < ny) {
+        if (oy < nx) out[to] = tile[icol][irow];
+        if (oy + BDIMX < nx) out[to + ny * BDIMX] = tile[icol][irow + BDIMX];
     }
 }
 
@@ -50,7 +52,7 @@ int main() {
 
     dim3 blockSize(BDIMX, BDIMY);
     dim3 gridSize(
-        (nx + blockSize.x - 1) / blockSize.x,
+        (nx + blockSize.x * 2 - 1) / (blockSize.x * 2),
         (ny + blockSize.y - 1) / blockSize.y
     );
     cudaEvent_t start, stop;
