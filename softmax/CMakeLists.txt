@@ -1,0 +1,1 @@
+add_executable(softmax0 softmax0.cu)

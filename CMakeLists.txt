@@ -9,6 +9,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -g")
 
 find_package(CUDAToolkit REQUIRED)
 
+add_subdirectory(softmax)
 add_subdirectory(sgemm)
 add_subdirectory(histogram)
 add_subdirectory(transpose)
