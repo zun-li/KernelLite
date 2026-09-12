@@ -35,34 +35,67 @@ void softmax_cpu(float *out, float *inp, int N, int C) {
     }
 }
 
+template<const int BLOCK_SIZE>
 __global__ void softmax_gpu(float *out, float *inp, int N, int C) {
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i < N) {
-        const float *inp_row = inp + i * C;
-        float *out_row = out + i * C;
+    __shared__ float shared[BLOCK_SIZE];
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    const float *inp_row = inp + bid * C;
+    float *out_row = out + bid * C;
 
-        float maxval = -INFINITY;
-        for (int j = 0; j < C; j ++) {
-            maxval = fmax(maxval, inp_row[j]);
-        }
+    // thread coarsening
+    float maxval = -INFINITY;
+    for (int i = tid; i < C; i += BLOCK_SIZE) {
+        maxval = fmax(maxval, inp_row[i]);
+    }
+    shared[tid] = maxval;
+    __syncthreads();
 
-        float sum = 0.f;
-        for (int j = 0; j < C; j ++) {
-            out_row[j] = expf(inp_row[j] - maxval);
-            sum += out_row[j];
+    // reductions
+    for (int stride = BLOCK_SIZE / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) {
+            shared[tid] = fmax(shared[tid], shared[tid + stride]);
         }
+    }
+    __syncthreads();
 
-        float norm = 1.f / sum;
-        for (int j = 0; j < C; j ++) {
-            out_row[j] *= norm;
+    // compute expf and write the result to global memory
+    float offset = shared[0];
+    for (int i = tid; i < C; i += BLOCK_SIZE) {
+        out_row[i] = expf(inp_row[i] - offset);
+    }
+    __syncthreads();
+
+    // thread coarsening again, for the sum
+    float sumval = 0.f;
+    for (int i = tid; i < C; i += BLOCK_SIZE) {
+        sumval += out_row[i];
+    }
+    shared[tid] = sumval;
+    __syncthreads();
+
+    // reductions
+    for (int stride = BLOCK_SIZE / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
         }
+    }
+    __syncthreads();
+
+    // divide the input values by the sum
+    float sum = shared[0];
+    for (int i = tid; i < C; i += BLOCK_SIZE) {
+        out_row[i] = out_row[i] / sum;
     }
 }
 
 int main() {
     // Example: batch size N=512, classes C=4096
-    int N = 512;
-    int C = 4096;
+    const int N = 512;
+    const int C = 4096;
+    const int BLOCK_SIZE = 128;
 
     size_t num_elements = N * C;
     float *inp = (float *)malloc(num_elements * sizeof(float));
@@ -88,14 +121,12 @@ int main() {
     cudaMalloc((void **)&d_inp, N * C * sizeof(float));
     cudaMemcpy(d_inp, inp, N * C * sizeof(float), cudaMemcpyHostToDevice);
     
-    int block_size = 128;
-    int grid_size = (N + block_size - 1) / block_size;
     
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
-    softmax_gpu<<<grid_size, block_size>>>(d_out, d_inp, N, C);
+    softmax_gpu<BLOCK_SIZE><<<N, BLOCK_SIZE>>>(d_out, d_inp, N, C);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
