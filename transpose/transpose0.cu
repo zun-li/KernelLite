@@ -38,13 +38,29 @@ int main() {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+
+    // Transpose warmup
+    int warmup_time = 10;
+    for (int i = 0; i < warmup_time; i++) {
+        transpose<<<gridSize, blockSize>>>(d_out, d_in, nx, ny);
+    }
+
+    cudaDeviceSynchronize();
+
+    // Transpose
+    int repeat_time = 5;
     cudaEventRecord(start);
-    transpose<<<gridSize, blockSize>>>(d_out, d_in, nx, ny);
+
+    for (int i = 0; i < repeat_time; i++) {
+        transpose<<<gridSize, blockSize>>>(d_out, d_in, nx, ny);
+    }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
+    ms /= repeat_time;
     printf("Kernel execution time: %.3f ms\n", ms);
 
     cudaEventDestroy(start);

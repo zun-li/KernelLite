@@ -69,12 +69,14 @@ Speedup 按 `CPU time / GPU time` 计算。
 
 输入规模：`4096 × 4096`，FP32。有效带宽按一次读取和一次写入计算。
 
-| Version      | Optimization            | Latency | Effective GB/s | Speedup |
-| ------------ | ----------------------- | ------: | -------------: | ------: |
-| `transpose0` | Naive Transpose         |     TBD |            TBD |   1.00× |
-| `transpose1` | Shared Memory Transpose |     TBD |            TBD |     TBD |
-| `transpose2` | Shared Memory Padding   |     TBD |            TBD |     TBD |
-| `transpose3` | Thread Coarsening       |     TBD |            TBD |     TBD |
+每项预热 10 次，随后运行 5 次取平均。
+
+| Version      | Optimization            | Latency (ms) | Effective GB/s | Speedup |
+| ------------ | ----------------------- | -----------: | -------------: | ------: |
+| `transpose0` | Naive Transpose         |        1.502 |          89.36 |   1.00× |
+| `transpose1` | Shared Memory Transpose |        0.703 |         190.92 |   2.14× |
+| `transpose2` | Shared Memory Padding   |        0.574 |         233.83 |   2.62× |
+| `transpose3` | Thread Coarsening       |        0.684 |         196.22 |   2.20× |
 
 ### Histogram
 
