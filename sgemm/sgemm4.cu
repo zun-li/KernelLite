@@ -8,8 +8,9 @@
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void mysgemm(int M, int N, int K,
-    float alpha, float* A, float* B, float beta, float* C) {
+__global__ __launch_bounds__(256)
+void mysgemm(int M, int N, int K,
+    float alpha, float *A, float *B, float beta, float *C) {
     int bx = blockIdx.x;
     int by = blockIdx.y;
 
@@ -20,8 +21,8 @@ __global__ void mysgemm(int M, int N, int K,
     int tx = (threadIdx.x % block_row_thread) * TN;
     int ty = (threadIdx.x / block_row_thread) * TM;
 
-    __shared__ float As[BK * BM];
-    __shared__ float Bs[BK * BN];
+    __shared__ float As[2][BK * BM];
+    __shared__ float Bs[2][BK * BN];
 
     const int ldg_a_num = BK * BM / thread_num / 4;
     const int ldg_b_num = BK * BN / thread_num / 4;
@@ -37,65 +38,139 @@ __global__ void mysgemm(int M, int N, int K,
     float accum[TM][TN] = {0.};
 
     float ldg_a_reg[4 * ldg_a_num] = {0.};
+    float ldg_b_reg[4 * ldg_b_num] = {0.};
 
-    float a_frag[TM];
-    float b_frag[TN];
+    float a_frag[2][TM];
+    float b_frag[2][TN];
 
     A = &A[by * BM * K];
     B = &B[bx * BN];
     C = &C[by * BM * N + bx * BN];
 
     #pragma unroll
-    for (int k = 0; k < K; k += BK) {
+    for (int i = 0; i < BM; i += a_tile_stride) {
+        int ldg_index = i / a_tile_stride * 4;
+        FETCH_FLOAT4(ldg_a_reg[ldg_index]) =
+            FETCH_FLOAT4(A[OFFSET(a_tile_row + i, a_tile_col, K)]);
+        As[0][OFFSET(a_tile_col, i + a_tile_row, BM)] = ldg_a_reg[ldg_index];
+        As[0][OFFSET(a_tile_col + 1, i + a_tile_row, BM)] =
+            ldg_a_reg[ldg_index + 1];
+        As[0][OFFSET(a_tile_col + 2, i + a_tile_row, BM)] =
+            ldg_a_reg[ldg_index + 2];
+        As[0][OFFSET(a_tile_col + 3, i + a_tile_row, BM)] =
+            ldg_a_reg[ldg_index + 3];
+    }
+    
+    #pragma unroll
+    for (int i = 0; i < BK; i += b_tile_stride) {
+        FETCH_FLOAT4(Bs[0][OFFSET(b_tile_row + i, b_tile_col, BN)]) =
+            FETCH_FLOAT4(B[OFFSET(b_tile_row + i, b_tile_col, N)]);
+    }
+    __syncthreads();
 
-        #pragma unroll
-        for (int i = 0; i < BM; i += a_tile_stride) {
-            int ldg_index = i / a_tile_stride * 4;
-            FETCH_FLOAT4(ldg_a_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(a_tile_row + i, a_tile_col, K)]);
-            As[OFFSET(a_tile_col, i + a_tile_row, BM)] = ldg_a_reg[ldg_index];
-            As[OFFSET(a_tile_col + 1, i + a_tile_row, BM)] = ldg_a_reg[ldg_index + 1];
-            As[OFFSET(a_tile_col + 2, i + a_tile_row, BM)] = ldg_a_reg[ldg_index + 2];
-            As[OFFSET(a_tile_col + 3, i + a_tile_row, BM)] = ldg_a_reg[ldg_index + 3];
+    #pragma unroll
+    for (int m = 0; m < TM; m += 4) {
+        FETCH_FLOAT4(a_frag[0][m]) = FETCH_FLOAT4(As[0][OFFSET(0, ty + m, BM)]);
+    }
+    
+    #pragma unroll
+    for (int n = 0; n < TN; n += 4) {
+        FETCH_FLOAT4(b_frag[0][n]) = FETCH_FLOAT4(Bs[0][OFFSET(0, tx + n, BN)]);
+    }
+
+    int write_index = 1;
+    int load_index;
+    int k = 0;
+    do {
+        k += BK;
+        if (k < K) {
+            #pragma unroll
+            for (int i = 0; i < BM; i += a_tile_stride) {
+                int ldg_index = i / a_tile_stride * 4;
+                FETCH_FLOAT4(ldg_a_reg[ldg_index]) =
+                    FETCH_FLOAT4(A[OFFSET(a_tile_row + i, k + a_tile_col, K)]);
+            }
+        
+            #pragma unroll
+            for (int i = 0; i < BK; i += b_tile_stride) {
+                int ldg_index = i / b_tile_stride * 4;
+                FETCH_FLOAT4(ldg_b_reg[ldg_index]) =
+                    FETCH_FLOAT4(B[OFFSET(k + b_tile_row + i, b_tile_col, N)]);
+            }
         }
 
+        load_index = write_index ^ 1;
+    
         #pragma unroll
-        for (int i = 0; i < BK; i += b_tile_stride) {
-            FETCH_FLOAT4(Bs[OFFSET(b_tile_row + i, b_tile_col, BN)]) =
-                FETCH_FLOAT4(B[OFFSET(b_tile_row + i, b_tile_col, N)]);
+        for (int bk = 0; bk < BK - 1; bk++) {
+            for (int m = 0; m < TM; m += 4) {
+                FETCH_FLOAT4(a_frag[(bk + 1) % 2][m]) =
+                    FETCH_FLOAT4(As[load_index][OFFSET(bk + 1, ty + m, BM)]);
+            }
+    
+            #pragma unroll
+            for (int n = 0; n < TN; n += 4) {
+                FETCH_FLOAT4(b_frag[(bk + 1) % 2][n]) =
+                    FETCH_FLOAT4(Bs[load_index][OFFSET(bk + 1, tx + n, BN)]);
+            }
+    
+            #pragma unroll
+            for (int m = 0; m < TM; m++) {
+                for (int n = 0; n < TN; n++) {
+                accum[m][n] += a_frag[bk % 2][m] * b_frag[bk % 2][n];
+                }
+            }
         }
-        __syncthreads();
-
-        A += BK;
-        B += BK * N;
-
-        #pragma unroll
-        for (int i = 0; i < BK; i++) {
+        if (k < K) {
+            #pragma unroll
+            for (int i = 0; i < BM; i += a_tile_stride) {
+                int ldg_index = i / a_tile_stride * 4;
+                As[write_index][OFFSET(a_tile_col, i + a_tile_row, BM)] =
+                    ldg_a_reg[ldg_index];
+                As[write_index][OFFSET(a_tile_col + 1, i + a_tile_row, BM)] =
+                    ldg_a_reg[ldg_index + 1];
+                As[write_index][OFFSET(a_tile_col + 2, i + a_tile_row, BM)] =
+                    ldg_a_reg[ldg_index + 2];
+                As[write_index][OFFSET(a_tile_col + 3, i + a_tile_row, BM)] =
+                    ldg_a_reg[ldg_index + 3];
+            }
+    
+            #pragma unroll
+            for (int i = 0; i < BK; i += b_tile_stride) {
+                int ldg_index = i / b_tile_stride * 4;
+                FETCH_FLOAT4(Bs[write_index][OFFSET(b_tile_row + i, b_tile_col, BN)]) =
+                    FETCH_FLOAT4(ldg_b_reg[ldg_index]);
+            }
+            __syncthreads();
 
             #pragma unroll
             for (int m = 0; m < TM; m += 4) {
-                FETCH_FLOAT4(a_frag[m]) = FETCH_FLOAT4(As[OFFSET(i, ty + m, BM)]);
+                FETCH_FLOAT4(a_frag[0][m]) =
+                    FETCH_FLOAT4(As[write_index][OFFSET(0, ty + m, BM)]);
             }
 
             #pragma unroll
             for (int n = 0; n < TN; n += 4) {
-                FETCH_FLOAT4(b_frag[n]) = FETCH_FLOAT4(Bs[OFFSET(i, tx + n, BN)]);
+                FETCH_FLOAT4(b_frag[0][n]) =
+                    FETCH_FLOAT4(Bs[write_index][OFFSET(0, tx + n, BN)]);
             }
 
+            write_index ^= 1;
+        }
+    
+        #pragma unroll
+        for (int m = 0; m < TM; m++) {
             #pragma unroll
-            for (int m = 0; m < TM; m++) {
-
-                #pragma unroll
-                for (int n = 0; n < TN; n++) {
-                    accum[m][n] += a_frag[m] * b_frag[n];
-                }
+            for (int n = 0; n < TN; n++) {
+                accum[m][n] += a_frag[(BK - 1) % 2][m] * b_frag[(BK - 1) % 2][n];
             }
         }
-        __syncthreads();
-    }
+
+    } while (k < K);
 
     #pragma unroll
     for (int m = 0; m < TM; m++) {
-
+    
         #pragma unroll
         for (int n = 0; n < TN; n += 4) {
             float4 ctmp = FETCH_FLOAT4(C[OFFSET(ty + m, tx + n, N)]);
