@@ -97,10 +97,14 @@ GElements/s 按 `(M × N) / (latency × 10^6)` 计算，其中 latency 的单位
 
 输入规模：`batch = 16, hidden_size = 1024`，FP32。
 
-| Version    | Optimization               | Latency | GElements/s | Speedup |
-| ---------- | -------------------------- | ------: | ----------: | ------: |
-| `rmsnorm0` | Block Reduction            |     TBD |         TBD |   1.00× |
-| `rmsnorm1` | Vectorized `float4` Access |     TBD |         TBD |     TBD |
+每项预热 10 次，随后运行 1000 次取平均。
+
+GElements/s 按 `(batch × hidden_size) / (latency × 10^6)` 计算，其中 latency 的单位为 ms。
+
+| Version    | Optimization               | CPU Time (ms) | GPU Latency (ms) | GElements/s | Max Absolute Error |
+| ---------- | -------------------------- | ------------: | ---------------: | ----------: | -----------------: |
+| `rmsnorm0` | Block Reduction            |         0.059 |         0.001956 |        8.38 |       2.384186e-06 |
+| `rmsnorm1` | Vectorized `float4` Access |         0.063 |         0.001961 |        8.35 |       2.861023e-06 |
 
 ### FlashAttention
 
