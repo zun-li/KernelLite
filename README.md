@@ -54,16 +54,16 @@ cuBLAS 结果取五组运行数据的中位数。
 
 输入规模：`512 × 4096`，FP32。
 
-每项 GPU 测试预热 10 次，随后运行 10 次取平均。
+每项 GPU 测试预热 100 次，随后运行 100 次取平均。
 
 Speedup 按 `CPU time / GPU time` 计算。
 
 | Version    | Optimization            | CPU Time (ms) | GPU Time (ms) | Speedup |
 | ---------- | ----------------------- | ------------: | ------------: | ------: |
-| `softmax0` | One Thread per Row      |       19.3174 |       1.41524 |  13.65× |
-| `softmax1` | Shared Memory Reduction |       17.5259 |     0.0457536 | 383.05× |
-| `softmax2` | Warp Shuffle Reduction  |       17.6517 |     0.0641728 | 275.07× |
-| `softmax3` | Multi-Warp Reduction    |       18.0294 |     0.0530656 | 339.76× |
+| `softmax0` | One Thread per Row      |       17.8385 |          1.33 |  13.41× |
+| `softmax1` | Shared Memory Reduction |       17.7147 |     0.0477901 | 370.68× |
+| `softmax2` | Warp Shuffle Reduction  |       17.5505 |     0.0647578 | 271.02× |
+| `softmax3` | Multi-Warp Reduction    |       17.6104 |     0.0551658 | 319.23× |
 
 ### Transpose
 

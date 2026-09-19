@@ -96,12 +96,12 @@ __global__ void softmax_gpu(float *out, float *inp, int N, int C) {
     }
     sumval = warpReduceSum(sumval);
 
-    if (laneId) sumvals[warpId] = sumval;
+    if (laneId == 0) sumvals[warpId] = sumval;
     __syncthreads();
 
     if (tid == 0) {
         float val = sumvals[tid];
-        for (int i = 0; i < warpsPerBlock; i ++) {
+        for (int i = 1; i < warpsPerBlock; i ++) {
             val += sumvals[i];
         }
         sumvals[0] = val;
@@ -149,19 +149,19 @@ int main() {
     cudaEventCreate(&stop);
 
     // Softmax warmup
-    int warmup_time = 10;
+    int warmup_time = 100;
     for (int i = 0; i < warmup_time; i++) {
-        softmax_gpu<<<N, 128>>>(d_out, d_inp, N, C);
+        softmax_gpu<<<N, 128, 2 * 4 * sizeof(float)>>>(d_out, d_inp, N, C);
     }
 
     cudaDeviceSynchronize();
 
     // Softmax
-    int repeat_time = 10;
+    int repeat_time = 100;
     cudaEventRecord(start);
 
     for (int i = 0; i < repeat_time; i++) {
-        softmax_gpu<<<N, 128>>>(d_out, d_inp, N, C);
+        softmax_gpu<<<N, 128, 2 * 4 * sizeof(float)>>>(d_out, d_inp, N, C);
     }
 
     cudaEventRecord(stop);

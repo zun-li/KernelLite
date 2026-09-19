@@ -96,7 +96,7 @@ int main() {
     cudaEventCreate(&stop);
 
     // Softmax warmup
-    int warmup_time = 10;
+    int warmup_time = 100;
     for (int i = 0; i < warmup_time; i++) {
         softmax_gpu<<<grid_size, block_size>>>(d_out, d_inp, N, C);
     }
@@ -104,7 +104,7 @@ int main() {
     cudaDeviceSynchronize();
 
     // Softmax
-    int repeat_time = 10;
+    int repeat_time = 100;
     cudaEventRecord(start);
 
     for (int i = 0; i < repeat_time; i++) {
