@@ -46,19 +46,39 @@ int main() {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    // Histogram warmup
+    int warmup_time = 10;
+    for (int i = 0; i < warmup_time; i++) {
+        hist<<<grid_size, block_size>>>(d_input, d_hist, size);
+    }
+
+    cudaDeviceSynchronize();
+    cudaMemset(d_hist, 0, 256 * sizeof(int));
+
+    // Histogram
+    int repeat_time = 5;
     cudaEventRecord(start);
-    hist<<<grid_size, block_size>>>(d_input, d_hist, size);
+
+    for (int i = 0; i < repeat_time; i++) {
+        hist<<<grid_size, block_size>>>(d_input, d_hist, size);
+    }
+
     cudaEventRecord(stop);
 
     cudaEventSynchronize(stop);
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
+    milliseconds /= repeat_time;
+    double gelements_per_second = size / (milliseconds * 1e6);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("cuda error:%d\n", err);
     }
-    printf("Kernel execution time: %f ms\n", milliseconds);
+    printf("Latency: %.6f ms | GElements/s: %.2f\n", milliseconds, gelements_per_second);
+
+    cudaMemset(d_hist, 0, 256 * sizeof(int));
+    hist<<<grid_size, block_size>>>(d_input, d_hist, size);
 
     int h_hist[256];
     cudaMemcpy(h_hist, d_hist, 256 * sizeof(int), cudaMemcpyDeviceToHost);

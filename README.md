@@ -67,9 +67,11 @@ Speedup 按 `CPU time / GPU time` 计算。
 
 ### Transpose
 
-输入规模：`4096 × 4096`，FP32。有效带宽按一次读取和一次写入计算。
+输入规模：`4096 × 4096`，FP32。
 
 每项预热 10 次，随后运行 5 次取平均。
+
+有效带宽按 `2 × nx × ny × sizeof(float) / latency` 计算，其中包含一次读取和一次写入。
 
 | Version      | Optimization            | Latency (ms) | Effective GB/s | Speedup |
 | ------------ | ----------------------- | -----------: | -------------: | ------: |
@@ -82,10 +84,14 @@ Speedup 按 `CPU time / GPU time` 计算。
 
 输入规模：`4096 × 4096`，UINT8，256 bins。
 
-| Version      | Optimization                | Latency | GElements/s | Speedup |
-| ------------ | --------------------------- | ------: | ----------: | ------: |
-| `histogram0` | Global Atomic Operations    |     TBD |         TBD |   1.00× |
-| `histogram1` | Shared Memory Privatization |     TBD |         TBD |     TBD |
+每项预热 10 次，随后运行 5 次取平均。
+
+GElements/s 按 `(M × N) / (latency × 10^6)` 计算，其中 latency 的单位为 ms。
+
+| Version      | Optimization                | Latency (ms) | GElements/s | Speedup |
+| ------------ | --------------------------- | -----------: | ----------: | ------: |
+| `histogram0` | Global Atomic Operations    |     4.434535 |        3.78 |   1.00× |
+| `histogram1` | Shared Memory Privatization |     0.060621 |      276.76 |  73.15× |
 
 ### RMSNorm
 
