@@ -147,13 +147,29 @@ int main() {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+
+    // Softmax warmup
+    int warmup_time = 10;
+    for (int i = 0; i < warmup_time; i++) {
+        softmax_gpu<<<N, 128>>>(d_out, d_inp, N, C);
+    }
+
+    cudaDeviceSynchronize();
+
+    // Softmax
+    int repeat_time = 10;
     cudaEventRecord(start);
-    softmax_gpu<<<N, 128>>>(d_out, d_inp, N, C);
+
+    for (int i = 0; i < repeat_time; i++) {
+        softmax_gpu<<<N, 128>>>(d_out, d_inp, N, C);
+    }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float gpu_time_ms = 0;
     cudaEventElapsedTime(&gpu_time_ms, start, stop);
+    gpu_time_ms /= repeat_time;
 
     cudaMemcpy(out_gpu, d_out, N * C * sizeof(float), cudaMemcpyDeviceToHost);
 
