@@ -108,9 +108,15 @@ GElements/s 按 `(batch × hidden_size) / (latency × 10^6)` 计算，其中 lat
 
 ### FlashAttention
 
-输入规模统一表示为 `batch × heads × sequence_length × head_dim`，FP32。
+输入规模为 `1 × 1 × 1024 × 128`（`batch × heads × sequence_length × head_dim`），FP32，非 causal forward。
 
-| Version      | Optimization            | Latency | GFLOP/s | Speedup | Peak Memory |
-| ------------ | ----------------------- | ------: | -------: | ------: | ----------: |
-| `self_attn`  | Standard Attention      |     TBD |      TBD |   1.00× |         TBD |
-| `flash_attn` | Tiling + Online Softmax |     TBD |      TBD |     TBD |         TBD |
+每项预热 10 次，随后运行 100 次取平均。Latency 仅包含 CUDA kernel 执行时间，不包含显存分配和数据拷贝。
+
+Peak Memory 统计 Q、K、V、O 和中间结果占用的全局显存，不包含 CUDA context。`flash_attn` 不生成完整的 attention score 矩阵；每个 block 另使用 36.55 KiB shared memory。
+
+显存降低比例以 `self_attn` 为基线，按 `(self_attn 峰值显存 - 当前版本峰值显存) / self_attn 峰值显存 × 100%` 计算。
+
+| Version      | Optimization            | Latency | Speedup | Peak Memory | Memory Reduction |
+| ------------ | ----------------------- | ------: | ------: | ----------: | ---------------: |
+| `self_attn`  | Standard Attention      | 1.742 ms |   1.00× |       6 MiB |            0.00% |
+| `flash_attn` | Tiling + Online Softmax | 1.133 ms |   1.54× |       2 MiB |           66.67% |

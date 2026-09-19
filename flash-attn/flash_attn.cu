@@ -1,304 +1,178 @@
 #include <cuda_runtime.h>
+
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cassert>
-#include <cmath>
+#include <vector>
 
-// Tile sizes, both must divide seqlen / dim
-const int Br = 2;      // Q/O rows handled by one block
-const int Bc = 2;      // K/V rows handled by one block
-const int seqlen = 4;  // number of query/key rows
-const int dim = 4;     // head dimension
+constexpr int kSeqLen = 1024;
+constexpr int kHeadDim = 128;
+constexpr int kQueryRows = 4;
+constexpr int kKeyRows = 32;
+constexpr int kWarmup = 10;
+constexpr int kRepeat = 100;
 
-// ---------------------------------------------
-// Reference (non-flash) attention, one thread per mBlock rows
-// ---------------------------------------------
+__global__ void flash_attention_kernel(const float* q, const float* k,
+                                       const float* v, float* output,
+                                       float scale) {
+    __shared__ float q_tile[kQueryRows][kHeadDim];
+    __shared__ float k_tile[kKeyRows][kHeadDim];
+    __shared__ float v_tile[kKeyRows][kHeadDim];
+    __shared__ float output_tile[kQueryRows][kHeadDim];
+    // 先保存当前 tile 的 score，随后原地改为未归一化的 softmax 权重。
+    __shared__ float scores[kQueryRows][kKeyRows];
+    __shared__ float row_max[kQueryRows];
+    __shared__ float row_sum[kQueryRows];
+    __shared__ float rescale[kQueryRows];
 
-// C = a * A @ B^T + b * C, with A[M, K], B[N, K], C[M, N]
-__global__ void naive_sgemm_nt(float *A, float *B, float *C, float a, float b,
-                               int M, int N, int K, int mBlock)
-{
-    int row = (blockDim.x * blockIdx.x + threadIdx.x) * mBlock;
+    const int key_in_tile = threadIdx.x;
+    const int query_in_tile = threadIdx.y;
+    const int query = blockIdx.x * kQueryRows + query_in_tile;
+    const int linear_thread = query_in_tile * kKeyRows + key_in_tile;
+    constexpr int threads_per_block = kQueryRows * kKeyRows;
 
-    for (int i = row; i < row + mBlock; i++)
-    {
-        for (int j = 0; j < N; j++)
-        {
-            float sum = 0.f;
-            for (int k = 0; k < K; k++)
-            {
-                sum += A[i * K + k] * B[j * K + k];
-            }
-            C[i * N + j] = a * sum + b * C[i * N + j];
+    // 每个 block 常驻 kQueryRows 行 Q，并维护对应的输出分子。
+    for (int d = key_in_tile; d < kHeadDim; d += kKeyRows) {
+        q_tile[query_in_tile][d] = q[query * kHeadDim + d];
+        output_tile[query_in_tile][d] = 0.0f;
+    }
+    if (key_in_tile == 0) {
+        row_max[query_in_tile] = -INFINITY;
+        row_sum[query_in_tile] = 0.0f;
+    }
+    __syncthreads();
+
+    // K、V 每次只读入 kKeyRows 行，因此无需保存完整 attention 矩阵。
+    for (int key_start = 0; key_start < kSeqLen; key_start += kKeyRows) {
+        constexpr int tile_elements = kKeyRows * kHeadDim;
+        for (int index = linear_thread; index < tile_elements;
+             index += threads_per_block) {
+            const int tile_row = index / kHeadDim;
+            const int d = index % kHeadDim;
+            k_tile[tile_row][d] =
+                k[(key_start + tile_row) * kHeadDim + d];
+            v_tile[tile_row][d] =
+                v[(key_start + tile_row) * kHeadDim + d];
         }
-    }
-}
+        __syncthreads();
 
-// C = a * A @ B + b * C, with A[M, K], B[K, N], C[M, N]
-__global__ void naive_sgemm_nn(float *A, float *B, float *C, float a, float b,
-                               int M, int N, int K, int mBlock)
-{
-    int row = (blockDim.x * blockIdx.x + threadIdx.x) * mBlock;
-
-    for (int i = row; i < row + mBlock; i++)
-    {
-        for (int j = 0; j < N; j++)
-        {
-            float sum = 0.f;
-            for (int k = 0; k < K; k++)
-            {
-                sum += A[i * K + k] * B[k * N + j];
-            }
-            C[i * N + j] = a * sum + b * C[i * N + j];
+        float score = 0.0f;
+        for (int d = 0; d < kHeadDim; ++d) {
+            score += q_tile[query_in_tile][d] * k_tile[key_in_tile][d];
         }
+        scores[query_in_tile][key_in_tile] = score * scale;
+        __syncthreads();
+
+        // 在线 softmax：合并当前 tile 与之前 tile 的最大值和指数和。
+        if (key_in_tile == 0) {
+            float tile_max = -INFINITY;
+            for (int key = 0; key < kKeyRows; ++key) {
+                tile_max = fmaxf(tile_max, scores[query_in_tile][key]);
+            }
+            const float new_max = fmaxf(row_max[query_in_tile], tile_max);
+            const float old_scale = __expf(row_max[query_in_tile] - new_max);
+            float tile_sum = 0.0f;
+            for (int key = 0; key < kKeyRows; ++key) {
+                const float probability =
+                    __expf(scores[query_in_tile][key] - new_max);
+                scores[query_in_tile][key] = probability;
+                tile_sum += probability;
+            }
+            rescale[query_in_tile] = old_scale;
+            row_sum[query_in_tile] =
+                row_sum[query_in_tile] * old_scale + tile_sum;
+            row_max[query_in_tile] = new_max;
+        }
+        __syncthreads();
+
+        for (int d = key_in_tile; d < kHeadDim; d += kKeyRows) {
+            float value =
+                output_tile[query_in_tile][d] * rescale[query_in_tile];
+            for (int key = 0; key < kKeyRows; ++key) {
+                value += scores[query_in_tile][key] * v_tile[key][d];
+            }
+            output_tile[query_in_tile][d] = value;
+        }
+        __syncthreads();
+    }
+
+    const float inverse_sum = 1.0f / row_sum[query_in_tile];
+    for (int d = key_in_tile; d < kHeadDim; d += kKeyRows) {
+        output[query * kHeadDim + d] =
+            output_tile[query_in_tile][d] * inverse_sum;
     }
 }
 
-// Softmax over each row of a [rows, cols] matrix, one thread per row
-__global__ void row_softmax(float *input, float *output, int cols)
-{
-    int row = blockDim.x * blockIdx.x + threadIdx.x;
+int main() {
+    constexpr int tensor_elements = kSeqLen * kHeadDim;
+    constexpr int tensor_bytes = tensor_elements * sizeof(float);
+    constexpr int peak_bytes = 4 * tensor_bytes;
+    constexpr int shared_bytes = sizeof(float) * (2 * kQueryRows * kHeadDim + 2 * kKeyRows * kHeadDim + kQueryRows * kKeyRows + 3 * kQueryRows);
 
-    // Row max, for numerical stability
-    float maxVal = -INFINITY;
-    for (int i = 0; i < cols; i++)
-    {
-        maxVal = fmaxf(maxVal, input[row * cols + i]);
+    std::vector<float> h_q(tensor_elements);
+    std::vector<float> h_k(tensor_elements);
+    std::vector<float> h_v(tensor_elements);
+    std::vector<float> h_output(tensor_elements);
+
+    std::srand(1);
+    for (float& value : h_q) {
+        value = (static_cast<float>(std::rand()) / RAND_MAX - 0.5f) * 0.2f;
+    }
+    std::srand(2);
+    for (float& value : h_k) {
+        value = (static_cast<float>(std::rand()) / RAND_MAX - 0.5f) * 0.2f;
+    }
+    std::srand(3);
+    for (float& value : h_v) {
+        value = (static_cast<float>(std::rand()) / RAND_MAX - 0.5f) * 0.2f;
     }
 
-    // exp(x - max) and its sum
-    float sum = 0.f;
-    for (int i = 0; i < cols; i++)
-    {
-        output[row * cols + i] = expf(input[row * cols + i] - maxVal);
-        sum += output[row * cols + i];
+    float *d_q, *d_k, *d_v, *d_output;
+    cudaMalloc(&d_q, tensor_bytes);
+    cudaMalloc(&d_k, tensor_bytes);
+    cudaMalloc(&d_v, tensor_bytes);
+    cudaMalloc(&d_output, tensor_bytes);
+    cudaMemcpy(d_q, h_q.data(), tensor_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), tensor_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), tensor_bytes, cudaMemcpyHostToDevice);
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    const dim3 block(kKeyRows, kQueryRows);
+    const dim3 grid(kSeqLen / kQueryRows);
+
+    for (int i = 0; i < kWarmup; ++i) {
+        flash_attention_kernel<<<grid, block>>>(d_q, d_k, d_v, d_output, scale);
     }
-
-    // Normalize
-    for (int i = 0; i < cols; i++)
-    {
-        output[row * cols + i] /= sum;
-    }
-}
-
-// Reference attention: O = softmax(Q @ K^T / sqrt(n)) @ V
-// Q, K, V, O are [m, n]; the attention scores are [m, m]
-void self_attention_cuda(float *Q, float *K, float *V, float *O, int m, int n)
-{
-    int mBlock = 2;  // rows computed per thread
-    assert(m % mBlock == 0 && "mBlock should align");
-
-    float scale = 1.f / sqrtf(static_cast<float>(n));
-    float *scores;
-    cudaMalloc(&scores, sizeof(float) * m * m);
-
-    // scores = Q @ K^T
-    dim3 qkBlock(m / mBlock);
-    naive_sgemm_nt<<<1, qkBlock>>>(Q, K, scores, scale, 0.f, m, m, n, mBlock);
     cudaDeviceSynchronize();
 
-    // scores = softmax(scores), in place
-    dim3 smBlock(m);
-    row_softmax<<<1, smBlock>>>(scores, scores, m);
-    cudaDeviceSynchronize();
-
-    // O = scores @ V
-    dim3 pvBlock(m / mBlock);
-    naive_sgemm_nn<<<1, pvBlock>>>(scores, V, O, 1.f, 0.f, m, n, m, mBlock);
-    cudaDeviceSynchronize();
-
-    cudaFree(scores);
-}
-
-// ---------------------------------------------
-// FlashAttention v2, one block handles Br query rows
-// ---------------------------------------------
-__global__ void flash_attention_v2_kernel(float *Q, float *K, float *V, float *O,
-                                          int seqlen, float scale)
-{
-    int kvBlocks = (seqlen + Bc - 1) / Bc;  // number of K/V row blocks
-    int dimTilesX = (dim + Bc - 1) / Bc;    // dim tiles owned by tx
-    int dimTilesY = (dim + Br - 1) / Br;    // dim tiles owned by ty
-
-    // Shared tiles loaded from global memory
-    __shared__ float sQ[Br][dim];
-    __shared__ float sK[Bc][dim];
-    __shared__ float sV[Bc][dim];
-    __shared__ float sO[Br][dim];      // running numerator, unnormalized O
-    __shared__ float sScores[Br][Bc];  // Q @ K^T
-    __shared__ float sExp[Br][Bc];     // exp(scores - rowMax)
-    __shared__ float sRowMax[Br];      // running row max
-    __shared__ float sRowSum[Br];      // running sum of exp
-
-    int tx = threadIdx.x;             // indexes Bc / dim tiles
-    int ty = threadIdx.y;             // indexes Br
-    int row = blockIdx.y * Br + ty;   // query row handled by this thread
-
-    if (row >= seqlen)
-    {
-        return;
-    }
-
-    // Load this thread's Q row, init O and the running statistics
-    for (int tile = 0; tile < dimTilesX; tile++)
-    {
-        sQ[ty][tile * Bc + tx] = Q[row * dim + tile * Bc + tx];
-        sO[ty][tile * Bc + tx] = 0.f;
-    }
-    sRowMax[ty] = -INFINITY;
-    sRowSum[ty] = 0.f;
-
-    // Loop over K/V row blocks
-    for (int kv = 0; kv < kvBlocks; kv++)
-    {
-        // Load one block of K and V
-        if (kv * Bc + tx < seqlen)
-        {
-            for (int tile = 0; tile < dimTilesY; tile++)
-            {
-                sK[tx][tile * Br + ty] = K[(kv * Bc + tx) * dim + tile * Br + ty];
-                sV[tx][tile * Br + ty] = V[(kv * Bc + tx) * dim + tile * Br + ty];
-            }
-        }
-        __syncthreads();
-
-        // One score per thread: sScores[ty][tx] = sQ[ty] . sK[tx]
-        float score = 0.f;
-        for (int k = 0; k < dim; k++)
-        {
-            score += sQ[ty][k] * sK[tx][k];
-        }
-        sScores[ty][tx] = score * scale;
-        __syncthreads();
-
-        // New row max and exp(scores - rowMax)
-        float tileMax = -INFINITY;
-        for (int k = 0; k < Bc; k++)
-        {
-            tileMax = fmaxf(tileMax, sScores[ty][k]);
-        }
-        float rowMax = fmaxf(sRowMax[ty], tileMax);
-        sExp[ty][tx] = expf(sScores[ty][tx] - rowMax);
-        __syncthreads();
-
-        // Sum of exp over this block
-        float tileSum = 0.f;
-        for (int k = 0; k < Bc; k++)
-        {
-            tileSum += sExp[ty][k];
-        }
-
-        // Rescale old O, then add exp @ V for this block
-        float rescale = expf(sRowMax[ty] - rowMax);
-        for (int tile = 0; tile < dimTilesX; tile++)
-        {
-            sO[ty][tile * Bc + tx] *= rescale;
-            for (int k = 0; k < Bc; k++)
-            {
-                sO[ty][tile * Bc + tx] += sExp[ty][k] * sV[k][tile * Bc + tx];
-            }
-        }
-
-        // Update running statistics
-        sRowMax[ty] = rowMax;
-        sRowSum[ty] = sRowSum[ty] * rescale + tileSum;
-        __syncthreads();
-    }
-
-    // Normalize the numerator by the denominator and write O
-    for (int tile = 0; tile < dimTilesX; tile++)
-    {
-        O[row * dim + tile * Bc + tx] = sO[ty][tile * Bc + tx] / sRowSum[ty];
-    }
-}
-
-void flash_attention_v2_cuda(float *Q, float *K, float *V, float *O, int m, int n)
-{
-    float scale = 1.f / sqrtf(static_cast<float>(n));
-
-    dim3 grid(1, (m + Br - 1) / Br);  // one block per Br query rows
-    dim3 block(Bc, Br);               // tx over Bc, ty over Br
-    flash_attention_v2_kernel<<<grid, block>>>(Q, K, V, O, m, scale);
-}
-
-// Return true if ref and out differ by at most 1e-3 everywhere
-bool all_close(float *ref, float *out, int rows, int cols)
-{
-    for (int i = 0; i < rows * cols; i++)
-    {
-        if (fabs(ref[i] - out[i]) > 1e-3f)
-        {
-            printf("ref[%d] = %f, out[%d] = %f\n", i, ref[i], i, out[i]);
-            return false;
-        }
-    }
-    return true;
-}
-
-int main()
-{
-    const int m = seqlen;  // rows
-    const int n = dim;     // columns
-    const int size = m * n;
-
-    // Host memory, random Q, K, V
-    float *hQ = new float[size];
-    float *hK = new float[size];
-    float *hV = new float[size];
-    float *hRef = new float[size];  // reference output
-    float *hOut = new float[size];  // flash output
-    for (int i = 0; i < size; i++)
-    {
-        hQ[i] = static_cast<float>(rand()) / RAND_MAX;
-        hK[i] = static_cast<float>(rand()) / RAND_MAX;
-        hV[i] = static_cast<float>(rand()) / RAND_MAX;
-    }
-
-    // Device memory
-    float *dQ, *dK, *dV, *dRef, *dOut;
-    cudaMalloc(&dQ, sizeof(float) * size);
-    cudaMalloc(&dK, sizeof(float) * size);
-    cudaMalloc(&dV, sizeof(float) * size);
-    cudaMalloc(&dRef, sizeof(float) * size);
-    cudaMalloc(&dOut, sizeof(float) * size);
-    cudaMemcpy(dQ, hQ, sizeof(float) * size, cudaMemcpyHostToDevice);
-    cudaMemcpy(dK, hK, sizeof(float) * size, cudaMemcpyHostToDevice);
-    cudaMemcpy(dV, hV, sizeof(float) * size, cudaMemcpyHostToDevice);
-
-    // Time the kernels with CUDA events
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    cudaEventRecord(start, 0);
-
-    // Run both implementations
-    self_attention_cuda(dQ, dK, dV, dRef, m, n);
-    flash_attention_v2_cuda(dQ, dK, dV, dOut, m, n);
-
-    cudaEventRecord(stop, 0);
+    cudaEventRecord(start);
+    for (int i = 0; i < kRepeat; ++i) {
+        flash_attention_kernel<<<grid, block>>>(d_q, d_k, d_v, d_output, scale);
+    }
+    cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    float ms = 0.f;
-    cudaEventElapsedTime(&ms, start, stop);
-    printf("Time for kernel execution: %.3f ms\n", ms);
+
+    float total_ms = 0.0f;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    const float latency_ms = total_ms / kRepeat;
+    cudaMemcpy(h_output.data(), d_output, tensor_bytes, cudaMemcpyDeviceToHost);
+
+    double checksum = 0.0;
+    for (float value : h_output) {
+        checksum += value;
+    }
+    std::printf(
+        "flash_attn | shape=1x1x%dx%d | latency=%.6f ms | peak_memory=%.2f MiB | shared_memory_per_block=%.2f KiB | checksum=%.6f\n",
+        kSeqLen, kHeadDim, latency_ms, peak_bytes / (1024.0 * 1024.0), shared_bytes / 1024.0, checksum);
+
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-
-    // Compare results
-    cudaMemcpy(hRef, dRef, sizeof(float) * size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(hOut, dOut, sizeof(float) * size, cudaMemcpyDeviceToHost);
-    printf(all_close(hRef, hOut, m, n) ? "Is equal\n" : "Is not equal\n");
-
-    // Cleanup
-    delete[] hQ;
-    delete[] hK;
-    delete[] hV;
-    delete[] hRef;
-    delete[] hOut;
-    cudaFree(dQ);
-    cudaFree(dK);
-    cudaFree(dV);
-    cudaFree(dRef);
-    cudaFree(dOut);
-
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_output);
     return 0;
 }

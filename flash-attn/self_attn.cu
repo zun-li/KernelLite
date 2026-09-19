@@ -1,201 +1,160 @@
 #include <cuda_runtime.h>
+
+#include <cmath>
 #include <cstdio>
-#include <cassert>
-#include <iostream>
-#include <fstream>
+#include <cstdlib>
+#include <vector>
 
-__global__ void naive_sgemm_nt(float *A, float *B, float *C,
-                               float a, float b, int M, int N, int K, int mBlock)
-{
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    idx *= mBlock;
+constexpr int kSeqLen = 1024;
+constexpr int kHeadDim = 128;
+constexpr int kWarmup = 10;
+constexpr int kRepeat = 100;
 
-    for (int i = idx; i < idx + mBlock; i++)
-    {
-        for (int j = 0; j < N; j++)
-        {
-            float sum = 0.f;
-            for (int k = 0; k < K; k++)
-            {
-                sum += A[i * K + k] * B[j * K + k];
-            }
-            C[i * N + j] = a * sum + b * C[i * N + j];
-        }
+// scores = Q @ K^T / sqrt(head_dim)
+__global__ void qk_kernel(const float* q, const float* k, float* scores,
+                          float scale) {
+    const int key = blockIdx.x * blockDim.x + threadIdx.x;
+    const int query = blockIdx.y * blockDim.y + threadIdx.y;
+
+    float sum = 0.0f;
+    for (int d = 0; d < kHeadDim; ++d) {
+        sum += q[query * kHeadDim + d] * k[key * kHeadDim + d];
     }
+    scores[query * kSeqLen + key] = sum * scale;
 }
 
-__global__ void naive_sgemm_nn(float *A, float *B, float *C,
-                               float a, float b, int M, int N, int K, int mBlock)
-{
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    idx *= mBlock;
-
-    for (int i = idx; i < idx + mBlock; i++)
-    {
-        for (int j = 0; j < N; j++)
-        {
-            float sum = 0.f;
-            for (int k = 0; k < K; k++)
-            {
-                sum += A[i * K + k] * B[k * N + j];
-            }
-            C[i * N + j] = a * sum + b * C[i * N + j];
-        }
-    }
-}
-
-__global__ void row_softmax(float *input, float *output, int n)
-{
-    const float *inp_row = input + blockIdx.x * n;
-    float *out_row = output + blockIdx.x * n;
-
-    __shared__ float maxvals[256];
-    __shared__ float sumvals[256];
+// In-place softmax, one block per row.
+__global__ void softmax_kernel(float* scores) {
+    __shared__ float reduction[256];
+    float* row = scores + blockIdx.x * kSeqLen;
 
     float local_max = -INFINITY;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-    {
-        local_max = fmaxf(local_max, inp_row[i]);
+    for (int col = threadIdx.x; col < kSeqLen; col += blockDim.x) {
+        local_max = fmaxf(local_max, row[col]);
     }
-    maxvals[threadIdx.x] = local_max;
+    reduction[threadIdx.x] = local_max;
     __syncthreads();
 
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
         if (threadIdx.x < stride) {
-            maxvals[threadIdx.x] = fmaxf(maxvals[threadIdx.x], maxvals[threadIdx.x + stride]);
+            reduction[threadIdx.x] =
+                fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
         }
         __syncthreads();
     }
-    float max_val = maxvals[0];
+    const float row_max = reduction[0];
 
-    float local_sum = 0.f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        local_sum += __expf(inp_row[i] - max_val);
+    float local_sum = 0.0f;
+    for (int col = threadIdx.x; col < kSeqLen; col += blockDim.x) {
+        const float value = __expf(row[col] - row_max);
+        row[col] = value;
+        local_sum += value;
     }
-    sumvals[threadIdx.x] = local_sum;
+    reduction[threadIdx.x] = local_sum;
     __syncthreads();
 
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
         if (threadIdx.x < stride) {
-            sumvals[threadIdx.x] += sumvals[threadIdx.x + stride];
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
         }
         __syncthreads();
     }
-    float sum_val = sumvals[0];
-
-    float inv_sum = 1.f / sum_val;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        out_row[i] = __expf(inp_row[i] - max_val) * inv_sum;
+    const float inverse_sum = 1.0f / reduction[0];
+    for (int col = threadIdx.x; col < kSeqLen; col += blockDim.x) {
+        row[col] *= inverse_sum;
     }
 }
 
-void self_attention_cuda(float *Q, float *K, float *V, float *O, int m, int n) {
-    int rows = 2;  // rows computed per thread
-    assert(m % rows == 0 && "rows should align");
+// O = softmax(scores) @ V
+__global__ void pv_kernel(const float* scores, const float* v, float* output) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int query = blockIdx.y * blockDim.y + threadIdx.y;
 
-    float scale = 1.f / sqrtf(static_cast<float>(n));
-    float *scores;  // scores[M, M]
-    cudaMalloc(&scores, sizeof(float) * m * m);
-
-    // scores = Q @ K^T
-    dim3 qk_blk(m / rows, 1, 1);
-    naive_sgemm_nt<<<1, qk_blk>>>(Q, K, scores, scale, 0, m, m, n, rows);
-    cudaDeviceSynchronize();
-
-    // softmax each row of scores[M, M]
-    dim3 sm_blk(m, 1, 1);
-    row_softmax<<<m, sm_blk>>>(scores, scores, m);
-    cudaDeviceSynchronize();
-
-    // O = scores[M, M] @ V[M, N]
-    dim3 qkv_blk(m / rows, 1, 1);
-    naive_sgemm_nn<<<1, qkv_blk>>>(scores, V, O, 1.f, 0.f, m, n, m, rows);
-    cudaDeviceSynchronize();
-
-    cudaFree(scores);
+    float sum = 0.0f;
+    for (int key = 0; key < kSeqLen; ++key) {
+        sum += scores[query * kSeqLen + key] * v[key * kHeadDim + d];
+    }
+    output[query * kHeadDim + d] = sum;
 }
 
-bool read_bin(const char *filename, float *h_data, size_t num_elements) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) {
-        printf("❌ Failed to open %s\n", filename);
-        return false;
-    }
-    file.read((char *)h_data, num_elements * sizeof(float));
-    if (!file) {
-        printf("❌ Failed to read data from %s\n", filename);
-        file.close();
-        return false;
-    }
-    file.close();
-    printf("✅ Loaded %s (%zu elements)\n", filename, num_elements);
-    return true;
-}
+int main() {
+    constexpr int tensor_elements = kSeqLen * kHeadDim;
+    constexpr int score_elements = kSeqLen * kSeqLen;
+    constexpr int tensor_bytes = tensor_elements * sizeof(float);
+    constexpr int score_bytes = score_elements * sizeof(float);
+    constexpr int peak_bytes = 4 * tensor_bytes + score_bytes;
 
-bool write_bin(const char *filename, const float *h_data, size_t num_elements) {
-    std::ofstream file(filename, std::ios::binary);
-    if (!file) {
-        printf("❌ Failed to create %s\n", filename);
-        return false;
-    }
-    file.write((const char *)h_data, num_elements * sizeof(float));
-    file.close();
-    printf("✅ Saved %s (%zu elements)\n", filename, num_elements);
-    return true;
-}
-
-int main()
-{
-    const int m = 64;
-    const int n = 128;
-
-    printf("🚀 Running self-attention for m=%d, n=%d\n", m, n);
-
-    size_t num_elements = m * n;
-
-    // Host memory
-    float *h_Q = new float[num_elements];
-    float *h_K = new float[num_elements];
-    float *h_V = new float[num_elements];
-    float *h_O = new float[num_elements];
-
-    // Read inputs
-    read_bin("/home/lz/repo/cuda/flash-attn/data/Q.bin", h_Q, num_elements);
-    read_bin("/home/lz/repo/cuda/flash-attn/data/K.bin", h_K, num_elements);
-    read_bin("/home/lz/repo/cuda/flash-attn/data/V.bin", h_V, num_elements);
-
-    // Device memory
-    float *d_Q, *d_K, *d_V, *d_O;
-    cudaMalloc(&d_Q, num_elements * sizeof(float));
-    cudaMalloc(&d_K, num_elements * sizeof(float));
-    cudaMalloc(&d_V, num_elements * sizeof(float));
-    cudaMalloc(&d_O, num_elements * sizeof(float));
-
-    // Copy to device
-    cudaMemcpy(d_Q, h_Q, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, h_K, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, h_V, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Run self attention
-    self_attention_cuda(d_Q, d_K, d_V, d_O, m, n);
-
-    // Copy result back
-    cudaMemcpy(h_O, d_O, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+    std::vector<float> h_q(tensor_elements);
+    std::vector<float> h_k(tensor_elements);
+    std::vector<float> h_v(tensor_elements);
+    std::vector<float> h_output(tensor_elements);
     
-    // Save output to data/O_cuda.bin
-    write_bin("/home/lz/repo/cuda/flash-attn/data/O_cuda.bin", h_O, num_elements);
+    std::srand(1);
+    for (float& value : h_q) {
+        value = (static_cast<float>(std::rand()) / RAND_MAX - 0.5f) * 0.2f;
+    }
+    std::srand(2);
+    for (float& value : h_k) {
+        value = (static_cast<float>(std::rand()) / RAND_MAX - 0.5f) * 0.2f;
+    }
+    std::srand(3);
+    for (float& value : h_v) {
+        value = (static_cast<float>(std::rand()) / RAND_MAX - 0.5f) * 0.2f;
+    }
 
-    // Cleanup
-    delete[] h_Q;
-    delete[] h_K;
-    delete[] h_V;
-    delete[] h_O;
-    cudaFree(d_Q);
-    cudaFree(d_K);
-    cudaFree(d_V);
-    cudaFree(d_O);
+    float *d_q, *d_k, *d_v, *d_scores, *d_output;
+    cudaMalloc(&d_q, tensor_bytes);
+    cudaMalloc(&d_k, tensor_bytes);
+    cudaMalloc(&d_v, tensor_bytes);
+    cudaMalloc(&d_scores, score_bytes);
+    cudaMalloc(&d_output, tensor_bytes);
+    cudaMemcpy(d_q, h_q.data(), tensor_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), tensor_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), tensor_bytes, cudaMemcpyHostToDevice);
 
-    printf("🎉 Self-attention completed. Output saved to O_cuda.bin\n");
+    const float scale = 1.0f / std::sqrt(kHeadDim);
+    const dim3 block(16, 16);
+    const dim3 qk_grid(kSeqLen / block.x, kSeqLen / block.y);
+    const dim3 pv_grid(kHeadDim / block.x, kSeqLen / block.y);
 
+    for (int i = 0; i < kWarmup; ++i) {
+        qk_kernel<<<qk_grid, block>>>(d_q, d_k, d_scores, scale);
+        softmax_kernel<<<kSeqLen, 256>>>(d_scores);
+        pv_kernel<<<pv_grid, block>>>(d_scores, d_v, d_output);
+    }
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    for (int i = 0; i < kRepeat; ++i) {
+        qk_kernel<<<qk_grid, block>>>(d_q, d_k, d_scores, scale);
+        softmax_kernel<<<kSeqLen, 256>>>(d_scores);
+        pv_kernel<<<pv_grid, block>>>(d_scores, d_v, d_output);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float total_ms = 0.0f;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    const float latency_ms = total_ms / kRepeat;
+    cudaMemcpy(h_output.data(), d_output, tensor_bytes, cudaMemcpyDeviceToHost);
+
+    double checksum = 0.0;
+    for (float value : h_output) {
+        checksum += value;
+    }
+    std::printf(
+        "self_attn | shape=1x1x%dx%d | latency=%.6f ms | peak_memory=%.2f MiB | checksum=%.6f\n",
+        kSeqLen, kHeadDim, latency_ms, peak_bytes / (1024.0 * 1024.0), checksum);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_scores);
+    cudaFree(d_output);
     return 0;
 }
