@@ -19,23 +19,33 @@ __global__ void flash_attention_kernel(const float* q, const float* k,
     __shared__ float k_tile[kKeyRows][kHeadDim];
     __shared__ float v_tile[kKeyRows][kHeadDim];
     __shared__ float output_tile[kQueryRows][kHeadDim];
-    // 先保存当前 tile 的 score，随后原地改为未归一化的 softmax 权重。
     __shared__ float scores[kQueryRows][kKeyRows];
     __shared__ float row_max[kQueryRows];
     __shared__ float row_sum[kQueryRows];
     __shared__ float rescale[kQueryRows];
 
+    // 当前线程负责的 tile 内 key 行号
     const int key_in_tile = threadIdx.x;
+
+    // 当前线程负责的 tile 内 query 行号
     const int query_in_tile = threadIdx.y;
-    const int query = blockIdx.x * kQueryRows + query_in_tile;
-    const int linear_thread = query_in_tile * kKeyRows + key_in_tile;
+
+    // 当前线程负责的全局 query 行号
+    const int query_row = blockIdx.x * kQueryRows + query_in_tile;
+    
+    // 用于协作加载时的一维线程编号
+    const int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // block 内的线程总数，协作加载时会用到
     constexpr int threads_per_block = kQueryRows * kKeyRows;
 
     // 每个 block 常驻 kQueryRows 行 Q，并维护对应的输出分子。
     for (int d = key_in_tile; d < kHeadDim; d += kKeyRows) {
-        q_tile[query_in_tile][d] = q[query * kHeadDim + d];
+        q_tile[query_in_tile][d] = q[query_row * kHeadDim + d];
         output_tile[query_in_tile][d] = 0.0f;
     }
+    
+    // 由每个 query 行对应的、tile 内 key 行号为 0 的线程负责该行最大值与指数和的初始化
     if (key_in_tile == 0) {
         row_max[query_in_tile] = -INFINITY;
         row_sum[query_in_tile] = 0.0f;
@@ -44,18 +54,22 @@ __global__ void flash_attention_kernel(const float* q, const float* k,
 
     // K、V 每次只读入 kKeyRows 行，因此无需保存完整 attention 矩阵。
     for (int key_start = 0; key_start < kSeqLen; key_start += kKeyRows) {
+
+        // 记录 tile 需要加载的元素个数
         constexpr int tile_elements = kKeyRows * kHeadDim;
-        for (int index = linear_thread; index < tile_elements;
-             index += threads_per_block) {
+
+        // block 内的线程协作加载 k_tile 和 v_tile
+        for (int index = thread_id; index < tile_elements; index += threads_per_block) {
+            
             const int tile_row = index / kHeadDim;
             const int d = index % kHeadDim;
-            k_tile[tile_row][d] =
-                k[(key_start + tile_row) * kHeadDim + d];
-            v_tile[tile_row][d] =
-                v[(key_start + tile_row) * kHeadDim + d];
+
+            k_tile[tile_row][d] = k[(key_start + tile_row) * kHeadDim + d];
+            v_tile[tile_row][d] = v[(key_start + tile_row) * kHeadDim + d];
         }
         __syncthreads();
 
+        // 每个线程计算一对 (query, key) 的点积得分并缩放
         float score = 0.0f;
         for (int d = 0; d < kHeadDim; ++d) {
             score += q_tile[query_in_tile][d] * k_tile[key_in_tile][d];
@@ -70,24 +84,23 @@ __global__ void flash_attention_kernel(const float* q, const float* k,
                 tile_max = fmaxf(tile_max, scores[query_in_tile][key]);
             }
             const float new_max = fmaxf(row_max[query_in_tile], tile_max);
-            const float old_scale = __expf(row_max[query_in_tile] - new_max);
+            const float old_scale = expf(row_max[query_in_tile] - new_max);
             float tile_sum = 0.0f;
             for (int key = 0; key < kKeyRows; ++key) {
-                const float probability =
-                    __expf(scores[query_in_tile][key] - new_max);
+                const float probability = expf(scores[query_in_tile][key] - new_max);
                 scores[query_in_tile][key] = probability;
                 tile_sum += probability;
             }
+            
             rescale[query_in_tile] = old_scale;
-            row_sum[query_in_tile] =
-                row_sum[query_in_tile] * old_scale + tile_sum;
+            row_sum[query_in_tile] = row_sum[query_in_tile] * old_scale + tile_sum;
             row_max[query_in_tile] = new_max;
         }
         __syncthreads();
 
+        // 用当前 tile 的 softmax 概率加权 V 并累加到输出分子（先按新最大值缩放历史累加值）
         for (int d = key_in_tile; d < kHeadDim; d += kKeyRows) {
-            float value =
-                output_tile[query_in_tile][d] * rescale[query_in_tile];
+            float value = output_tile[query_in_tile][d] * rescale[query_in_tile];
             for (int key = 0; key < kKeyRows; ++key) {
                 value += scores[query_in_tile][key] * v_tile[key][d];
             }
@@ -96,9 +109,10 @@ __global__ void flash_attention_kernel(const float* q, const float* k,
         __syncthreads();
     }
 
+    // 用指数和归一化累加的输出分子，得到最终 attention 输出并写回全局显存
     const float inverse_sum = 1.0f / row_sum[query_in_tile];
     for (int d = key_in_tile; d < kHeadDim; d += kKeyRows) {
-        output[query * kHeadDim + d] =
+        output[query_row * kHeadDim + d] =
             output_tile[query_in_tile][d] * inverse_sum;
     }
 }
